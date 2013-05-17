@@ -1,7 +1,8 @@
 package Slic3r::GUI::PreviewCanvas;
 use strict;
 use warnings;
- 
+
+use Wx;
 use Wx::Event qw(EVT_PAINT EVT_SIZE EVT_ERASE_BACKGROUND EVT_IDLE EVT_TIMER EVT_MOUSEWHEEL);
 # must load OpenGL *before* Wx::GLCanvas
 use OpenGL qw(:glconstants :glfunctions);
