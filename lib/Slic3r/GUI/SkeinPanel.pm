@@ -49,9 +49,12 @@ sub new {
             $self->{tabpanel},
             on_value_change     => sub {
                 $self->{plater}->on_config_change(@_) if $self->{plater}; # propagate config change events to the plater
-                if ($self->{mode} eq 'simple' && $init) {  # don't save while loading for the first time
-                    # save config
-                    $self->config->save("$Slic3r::GUI::datadir/simple.ini");
+                if ($init) {  # don't save while loading for the first time
+                    if ($self->{mode} eq 'simple') {
+                        # save config
+                        $self->config->save("$Slic3r::GUI::datadir/simple.ini");
+                    }
+                    $self->config->save($Slic3r::GUI::autosave) if $Slic3r::GUI::autosave;
                 }
             },
             on_presets_changed  => sub {
@@ -73,7 +76,7 @@ sub new {
     return $self;
 }
 
-sub do_slice {
+sub quick_slice {
     my $self = shift;
     my %params = @_;
     
@@ -244,7 +247,9 @@ sub load_config_file {
     $Slic3r::GUI::Settings->{recent}{config_directory} = dirname($file);
     Slic3r::GUI->save_settings;
     $last_config = $file;
-    $_->load_config_file($file) for values %{$self->{options_tabs}};
+    for my $tab (values %{$self->{options_tabs}}) {
+        $tab->load_config_file($file);
+    }
 }
 
 sub load_config {
@@ -262,7 +267,9 @@ sub config_wizard {
     return unless $self->check_unsaved_changes;
     if (my $config = Slic3r::GUI::ConfigWizard->new($self)->run) {
         if ($self->{mode} eq 'expert') {
-            $_->select_default_preset for values %{$self->{options_tabs}};
+            for my $tab (values %{$self->{options_tabs}}) {
+                $tab->select_default_preset;
+            }
         }
         $self->load_config($config);
     }

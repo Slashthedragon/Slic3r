@@ -4,13 +4,14 @@ use Moo;
 use List::Util qw(min sum first);
 use Slic3r::ExtrusionPath ':roles';
 use Slic3r::Geometry qw(Z PI scale unscale deg2rad rad2deg scaled_epsilon chained_path_points);
-use Slic3r::Geometry::Clipper qw(diff_ex intersection_ex union_ex offset collapse_ex);
+use Slic3r::Geometry::Clipper qw(diff_ex intersection_ex union_ex offset collapse_ex
+    offset2 diff intersection);
 use Slic3r::Surface ':types';
 
 has 'print'             => (is => 'ro', weak_ref => 1, required => 1);
 has 'input_file'        => (is => 'rw', required => 0);
 has 'meshes'            => (is => 'rw', default => sub { [] });  # by region_id
-has 'size'              => (is => 'rw', required => 1);
+has 'size'              => (is => 'rw', required => 1); # XYZ in scaled coordinates
 has 'copies'            => (is => 'rw', trigger => 1);  # in scaled coordinates
 has 'layers'            => (is => 'rw', default => sub { [] });
 has 'layer_height_ranges' => (is => 'rw', default => sub { [] }); # [ z_min, z_max, layer_height ]
@@ -137,12 +138,18 @@ sub bounding_box {
     my $self = shift;
     
     # since the object is aligned to origin, bounding box coincides with size
-    return Slic3r::Geometry::bounding_box([ [0,0], $self->size ]);
+    return Slic3r::Geometry::BoundingBox->new_from_points([ [0,0], $self->size ]);
 }
 
 sub slice {
     my $self = shift;
     my %params = @_;
+    
+    # make sure all layers contain layer region objects for all regions
+    my $regions_count = $self->print->regions_count;
+    foreach my $layer (@{ $self->layers }) {
+        $layer->region($_) for 0 .. ($regions_count-1);
+    }
     
     # process facets
     for my $region_id (0 .. $#{$self->meshes}) {
@@ -151,8 +158,7 @@ sub slice {
         my $apply_lines = sub {
             my $lines = shift;
             foreach my $layer_id (keys %$lines) {
-                my $layerm = $self->layers->[$layer_id]->region($region_id);
-                push @{$layerm->lines}, @{$lines->{$layer_id}};
+                push @{$self->layers->[$layer_id]->regions->[$region_id]->lines}, @{$lines->{$layer_id}};
             }
         };
         Slic3r::parallelize(
@@ -183,18 +189,14 @@ sub slice {
         
         $self->meshes->[$region_id] = undef;  # free memory
     }
-    die "Invalid input file\n" if !@{$self->layers};
     
     # free memory
     $self->meshes(undef);
     
     # remove last layer(s) if empty
-    pop @{$self->layers} while !map @{$_->lines}, @{$self->layers->[-1]->regions};
+    pop @{$self->layers} while @{$self->layers} && (!map @{$_->lines}, @{$self->layers->[-1]->regions});
     
     foreach my $layer (@{ $self->layers }) {
-        # make sure all layers contain layer region objects for all regions
-        $layer->region($_) for 0 .. ($self->print->regions_count-1);
-        
         Slic3r::debugf "Making surfaces for layer %d (slice z = %f):\n",
             $layer->id, unscale $layer->slice_z if $Slic3r::debug;
         
@@ -276,9 +278,6 @@ sub slice {
             $self->layers->[$i]->id($i);
         }
     }
-    
-    warn "No layers were detected. You might want to repair your STL file and retry.\n"
-        if !@{$self->layers};
 }
 
 sub make_perimeters {
@@ -300,19 +299,17 @@ sub make_perimeters {
                 
                 my $overlap = $perimeter_spacing;  # one perimeter
                 
-                my $diff = diff_ex(
+                my $diff = diff(
                     [ offset([ map @{$_->expolygon}, @{$layerm->slices} ], -($Slic3r::Config->perimeters * $perimeter_spacing)) ],
                     [ offset([ map @{$_->expolygon}, @{$upper_layerm->slices} ], -$overlap) ],
                 );
                 next if !@$diff;
                 # if we need more perimeters, $diff should contain a narrow region that we can collapse
                 
-                $diff = diff_ex(
-                    [ map @$_, @$diff ],
-                    [ offset(
-                        [ offset([ map @$_, @$diff ], -$perimeter_spacing) ],
-                        +$perimeter_spacing
-                    ) ],
+                $diff = diff(
+                    $diff,
+                    [ offset2($diff, -$perimeter_spacing, +$perimeter_spacing) ],
+                    1,
                 );
                 next if !@$diff;
                 # diff contains the collapsed area
@@ -323,18 +320,14 @@ sub make_perimeters {
                         # compute polygons representing the thickness of the hypotetical new internal perimeter
                         # of our slice
                         $extra_perimeters++;
-                        my $hypothetical_perimeter = diff_ex(
+                        my $hypothetical_perimeter = diff(
                             [ offset($slice->expolygon, -($perimeter_spacing * ($Slic3r::Config->perimeters + $extra_perimeters-1))) ],
                             [ offset($slice->expolygon, -($perimeter_spacing * ($Slic3r::Config->perimeters + $extra_perimeters))) ],
                         );
                         last CYCLE if !@$hypothetical_perimeter;  # no extra perimeter is possible
                         
                         # only add the perimeter if there's an intersection with the collapsed area
-                        my $intersection = intersection_ex(
-                            [ map @$_, @$diff ],
-                            [ map @$_, @$hypothetical_perimeter ],
-                        );
-                        last CYCLE if !@$intersection;
+                        last CYCLE if !@{ intersection($diff, $hypothetical_perimeter) };
                         Slic3r::debugf "  adding one more perimeter at layer %d\n", $layer_id;
                         $slice->extra_perimeters($extra_perimeters);
                     }
@@ -392,7 +385,6 @@ sub detect_surfaces_type {
             1,
         );
         return map Slic3r::Surface->new(expolygon => $_, surface_type => $result_type),
-            grep $_->is_printable($layerm->perimeter_flow->scaled_width),
             @$expolygons;
     };
     
@@ -606,7 +598,8 @@ sub discover_horizontal_shells {
         for (my $i = 0; $i < $self->layer_count; $i++) {
             my $layerm = $self->layers->[$i]->regions->[$region_id];
             
-            if ($Slic3r::Config->solid_infill_every_layers && ($i % $Slic3r::Config->solid_infill_every_layers) == 0) {
+            if ($Slic3r::Config->solid_infill_every_layers && $Slic3r::Config->fill_density > 0
+                && ($i % $Slic3r::Config->solid_infill_every_layers) == 0) {
                 $_->surface_type(S_TYPE_INTERNALSOLID)
                     for grep $_->surface_type == S_TYPE_INTERNAL, @{$layerm->fill_surfaces};
             }
@@ -748,8 +741,8 @@ sub combine_infill {
             my @layerms = map $self->layers->[$_]->regions->[$region_id],
                 ($layer_id - ($combine[$layer_id]-1) .. $layer_id);
             
-            # process internal and internal-solid infill separately
-            for my $type (S_TYPE_INTERNAL, S_TYPE_INTERNALSOLID) {
+            # only combine internal infill
+            for my $type (S_TYPE_INTERNAL) {
                 # we need to perform a multi-layer intersection, so let's split it in pairs
                 
                 # initialize the intersection with the candidates of the lowest layer
@@ -1010,7 +1003,7 @@ sub generate_support_material {
                         $_;
                     }
                     map $_->clip_with_expolygon($expolygon),
-                    ###map $_->clip_with_polygon($expolygon->bounding_box_polygon),  # currently disabled as a workaround for Boost failing at being idempotent
+                    ###map $_->clip_with_polygon($expolygon->bounding_box->polygon),  # currently disabled as a workaround for Boost failing at being idempotent
                     ($is_interface && @$support_interface_patterns)
                         ? @{$support_interface_patterns->[ $layer_id % @$support_interface_patterns ]}
                         : @{$support_patterns->[ $layer_id % @$support_patterns ]};

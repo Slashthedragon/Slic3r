@@ -26,6 +26,7 @@ my %cli_options = ();
         
         'save=s'                => \$opt{save},
         'load=s@'               => \$opt{load},
+        'autosave=s'            => \$opt{autosave},
         'ignore-nonexistent-config' => \$opt{ignore_nonexistent_config},
         'no-plater'             => \$opt{no_plater},
         'gui-mode=s'            => \$opt{gui_mode},
@@ -78,6 +79,7 @@ if (!@ARGV && !$opt{save} && eval "require Slic3r::GUI; 1") {
         $Slic3r::GUI::datadir   = $opt{datadir};
         $Slic3r::GUI::no_plater = $opt{no_plater};
         $Slic3r::GUI::mode      = $opt{gui_mode};
+        $Slic3r::GUI::autosave  = $opt{autosave};
     }
     $gui = Slic3r::GUI->new;
     $gui->{skeinpanel}->load_config_file($_) for @{$opt{load}};
@@ -152,6 +154,7 @@ $j
   GUI options:
     --no-plater         Disable the plater tab
     --gui-mode          Overrides the configured mode (simple/expert)
+    --autosave <file>   Automatically export current configuration to the specified file
 
   Output options:
     --output-filename-format
@@ -170,7 +173,7 @@ $j
                         (default: $config->{print_center}->[0],$config->{print_center}->[1])
     --z-offset          Additional height in mm to add to vertical coordinates
                         (+/-, default: $config->{z_offset})
-    --gcode-flavor      The type of G-code to generate (reprap/teacup/makerbot/sailfish/mach3/no-extrusion,
+    --gcode-flavor      The type of G-code to generate (reprap/teacup/makerware/sailfish/mach3/no-extrusion,
                         default: $config->{gcode_flavor})
     --use-relative-e-distances Enable this to get relative E values
     --gcode-arcs        Use G2/G3 commands for native arcs (experimental, not supported

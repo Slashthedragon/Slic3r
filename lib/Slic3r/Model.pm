@@ -6,6 +6,7 @@ use Slic3r::Geometry qw(X Y Z MIN move_points);
 
 has 'materials' => (is => 'ro', default => sub { {} });
 has 'objects'   => (is => 'ro', default => sub { [] });
+has '_bounding_box' => (is => 'rw');
 
 sub read_from_file {
     my $class = shift;
@@ -57,6 +58,7 @@ sub add_object {
     
     my $object = Slic3r::Model::Object->new(model => $self, @_);
     push @{$self->objects}, $object;
+    $self->_bounding_box(undef);
     return $object;
 }
 
@@ -68,11 +70,6 @@ sub set_material {
         model       => $self,
         attributes  => $attributes || {},
     );
-}
-
-sub scale {
-    my $self = shift;
-    $_->scale(@_) for @{$self->objects};
 }
 
 sub arrange_objects {
@@ -119,6 +116,7 @@ sub arrange_objects {
                 $object->add_instance(
                     offset      => $_,
                     rotation    => $instance->rotation,
+                    scaling_factor => $instance->scaling_factor,
                 ) for move_points($instance->offset, @positions);
             }
         }
@@ -150,8 +148,9 @@ sub _arrange {
         return ($config->duplicate_grid->[X] * $config->duplicate_grid->[Y]), @positions;
     } else {
         my $total_parts = $config->duplicate * @items;
-        my $partx = max(map $_->size->[X], @items);
-        my $party = max(map $_->size->[Y], @items);
+        my @sizes = map $_->size, @items;
+        my $partx = max(map $_->[X], @sizes);
+        my $party = max(map $_->[Y], @sizes);
         return $config->duplicate,
             Slic3r::Geometry::arrange
                 ($total_parts, $partx, $party, (map $_, @{$config->bed_size}),
@@ -164,14 +163,23 @@ sub vertices {
     return [ map @{$_->vertices}, @{$self->objects} ];
 }
 
-sub size {
+sub used_vertices {
     my $self = shift;
-    return [ Slic3r::Geometry::size_3D($self->vertices) ];
+    return [ map @{$_->used_vertices}, @{$self->objects} ];
 }
 
-sub extents {
+sub size {
     my $self = shift;
-    return Slic3r::Geometry::bounding_box_3D($self->vertices);
+    return $self->bounding_box->size;
+}
+
+sub bounding_box {
+    my $self = shift;
+    
+    if (!defined $self->_bounding_box) {
+        $self->_bounding_box(Slic3r::Geometry::BoundingBox->new_from_points_3D($self->used_vertices));
+    }
+    return $self->_bounding_box;
 }
 
 sub align_to_origin {
@@ -179,13 +187,31 @@ sub align_to_origin {
     
     # calculate the displacements needed to 
     # have lowest value for each axis at coordinate 0
-    my @extents = $self->extents;
-    $self->move(map -$extents[$_][MIN], X,Y,Z);
+    {
+        my $bb = $self->bounding_box;
+        $self->move(map -$bb->extents->[$_][MIN], X,Y,Z);
+    }
+    
+    # align all instances to 0,0 as well
+    {
+        my @instances = map @{$_->instances}, @{$self->objects};
+        my @extents = Slic3r::Geometry::bounding_box_3D([ map $_->offset, @instances ]);
+        $_->offset->translate(-$extents[X][MIN], -$extents[Y][MIN]) for @instances;
+    }
+}
+
+sub scale {
+    my $self = shift;
+    $_->scale(@_) for @{$self->objects};
+    $self->_bounding_box->scale(@_) if defined $self->_bounding_box;
 }
 
 sub move {
     my $self = shift;
-    $_->move(@_) for @{$self->objects};
+    my @shift = @_;
+    
+    $_->move(@shift) for @{$self->objects};
+    $self->_bounding_box->translate(@shift) if defined $self->_bounding_box;
 }
 
 # flattens everything to a single mesh
@@ -199,6 +225,7 @@ sub mesh {
             my $mesh = $object->mesh->clone;
             if ($instance) {
                 $mesh->rotate($instance->rotation);
+                $mesh->scale($instance->scaling_factor);
                 $mesh->align_to_origin;
                 $mesh->move(@{$instance->offset});
             }
@@ -238,13 +265,14 @@ sub split_meshes {
             
             # let's now align the new object to the origin and put its displacement
             # (extents) in the instances info
-            my @extents = $mesh->extents;
+            my $bb = $mesh->bounding_box;
             $new_object->align_to_origin;
             
             # add one instance per original instance applying the displacement
             $new_object->add_instance(
-                offset      => [ $_->offset->[X] + $extents[X][MIN], $_->offset->[Y] + $extents[Y][MIN] ],
+                offset      => [ $_->offset->[X] + $bb->x_min, $_->offset->[Y] + $bb->y_min ],
                 rotation    => $_->rotation,
+                scaling_factor => $_->scaling_factor,
             ) for @{ $object->instances // [] };
         }
     }
@@ -260,7 +288,7 @@ package Slic3r::Model::Object;
 use Moo;
 
 use List::Util qw(first);
-use Slic3r::Geometry qw(X Y Z MIN move_points_3D);
+use Slic3r::Geometry qw(X Y Z MIN MAX move_points move_points_3D);
 use Storable qw(dclone);
 
 has 'input_file' => (is => 'rw');
@@ -269,6 +297,7 @@ has 'vertices'  => (is => 'ro', default => sub { [] });
 has 'volumes'   => (is => 'ro', default => sub { [] });
 has 'instances' => (is => 'rw');
 has 'layer_height_ranges' => (is => 'rw', default => sub { [] }); # [ z_min, z_max, layer_height ]
+has '_bounding_box' => (is => 'rw');
 
 sub add_volume {
     my $self = shift;
@@ -287,6 +316,8 @@ sub add_volume {
     
     my $volume = Slic3r::Model::Volume->new(object => $self, %args);
     push @{$self->volumes}, $volume;
+    $self->_bounding_box(undef);
+    $self->model->_bounding_box(undef);
     return $volume;
 }
 
@@ -295,6 +326,7 @@ sub add_instance {
     
     $self->instances([]) if !defined $self->instances;
     push @{$self->instances}, Slic3r::Model::Instance->new(object => $self, @_);
+    $self->model->_bounding_box(undef);
     return $self->instances->[-1];
 }
 
@@ -309,14 +341,28 @@ sub mesh {
     );
 }
 
-sub size {
+sub used_vertices {
     my $self = shift;
-    return [ Slic3r::Geometry::size_3D($self->vertices) ];
+    return [ map $self->vertices->[$_], map @$_, map @{$_->facets}, @{$self->volumes} ];
 }
 
-sub extents {
+sub size {
     my $self = shift;
-    return Slic3r::Geometry::bounding_box_3D($self->vertices);
+    return $self->bounding_box->size;
+}
+
+sub center {
+    my $self = shift;
+    return $self->bounding_box->center;
+}
+
+sub bounding_box {
+    my $self = shift;
+    
+    if (!defined $self->_bounding_box) {
+        $self->_bounding_box(Slic3r::Geometry::BoundingBox->new_from_points_3D($self->used_vertices));
+    }
+    return $self->_bounding_box;
 }
 
 sub align_to_origin {
@@ -324,13 +370,18 @@ sub align_to_origin {
     
     # calculate the displacements needed to 
     # have lowest value for each axis at coordinate 0
-    my @extents = $self->extents;
-    $self->move(map -$extents[$_][MIN], X,Y,Z);
+    my $bb = $self->bounding_box;
+    my @shift = map -$bb->extents->[$_][MIN], X,Y,Z;
+    $self->move(@shift);
+    return @shift;
 }
 
 sub move {
     my $self = shift;
-    @{$self->vertices} = move_points_3D([ @_ ], @{$self->vertices});
+    my @shift = @_;
+    
+    @{$self->vertices} = move_points_3D([ @shift ], @{$self->vertices});
+    $self->_bounding_box->translate(@shift) if defined $self->_bounding_box;
 }
 
 sub scale {
@@ -342,6 +393,8 @@ sub scale {
     foreach my $vertex (@{$self->vertices}) {
         $vertex->[$_] *= $factor for X,Y,Z;
     }
+    
+    $self->_bounding_box->scale($factor) if defined $self->_bounding_box;
 }
 
 sub rotate {
@@ -355,6 +408,8 @@ sub rotate {
     foreach my $vertex (@{$self->vertices}) {
         @$vertex = (@{ +(Slic3r::Geometry::rotate_points($rad, undef, [ $vertex->[X], $vertex->[Y] ]))[0] }, $vertex->[Z]);
     }
+    
+    $self->_bounding_box(undef);
 }
 
 sub materials_count {
@@ -390,7 +445,8 @@ package Slic3r::Model::Instance;
 use Moo;
 
 has 'object'    => (is => 'ro', weak_ref => 1, required => 1);
-has 'rotation'  => (is => 'rw', default => sub { 0 });
-has 'offset'    => (is => 'rw');
+has 'rotation'  => (is => 'rw', default => sub { 0 });  # around mesh center point
+has 'scaling_factor' => (is => 'rw', default => sub { 1 });
+has 'offset'    => (is => 'rw');  # must be Slic3r::Point object
 
 1;

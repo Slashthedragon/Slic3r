@@ -4,7 +4,7 @@ use Moo;
 require Exporter;
 our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(EXTR_ROLE_PERIMETER EXTR_ROLE_EXTERNAL_PERIMETER 
-    EXTR_ROLE_CONTOUR_INTERNAL_PERIMETER
+    EXTR_ROLE_CONTOUR_INTERNAL_PERIMETER EXTR_ROLE_OVERHANG_PERIMETER
     EXTR_ROLE_FILL EXTR_ROLE_SOLIDFILL EXTR_ROLE_TOPSOLIDFILL EXTR_ROLE_BRIDGE 
     EXTR_ROLE_INTERNALBRIDGE EXTR_ROLE_SKIRT EXTR_ROLE_SUPPORTMATERIAL EXTR_ROLE_GAPFILL);
 our %EXPORT_TAGS = (roles => \@EXPORT_OK);
@@ -24,7 +24,8 @@ has 'flow_spacing' => (is => 'rw', required => 1);
 has 'role'         => (is => 'rw', required => 1);
 
 use constant EXTR_ROLE_PERIMETER                    => 0;
-use constant EXTR_ROLE_EXTERNAL_PERIMETER           => 2;
+use constant EXTR_ROLE_EXTERNAL_PERIMETER           => 1;
+use constant EXTR_ROLE_OVERHANG_PERIMETER           => 2;
 use constant EXTR_ROLE_CONTOUR_INTERNAL_PERIMETER   => 3;
 use constant EXTR_ROLE_FILL                         => 4;
 use constant EXTR_ROLE_SOLIDFILL                    => 5;
@@ -59,6 +60,17 @@ sub pack {
 # no-op, this allows to use both packed and non-packed objects in Collections
 sub unpack { $_[0] }
 
+sub clone {
+    my $self = shift;
+    my %p = @_;
+    
+    $p{polyline} ||= $self->polyline->clone;
+    return (ref $self)->new(
+        (map { $_ => $self->$_ } qw(polyline height flow_spacing role)),
+        %p,
+    );
+}
+
 sub clip_with_polygon {
     my $self = shift;
     my ($polygon) = @_;
@@ -70,16 +82,24 @@ sub clip_with_expolygon {
     my $self = shift;
     my ($expolygon) = @_;
     
-    my @paths = ();
-    foreach my $polyline ($self->polyline->clip_with_expolygon($expolygon)) {
-        push @paths, (ref $self)->new(
-            polyline        => $polyline,
-            height          => $self->height,
-            flow_spacing    => $self->flow_spacing,
-            role            => $self->role,
-        );
-    }
-    return @paths;
+    return map $self->clone(polyline => $_),
+        $self->polyline->clip_with_expolygon($expolygon);
+}
+
+sub intersect_expolygons {
+    my $self = shift;
+    my ($expolygons) = @_;
+    
+    return map $self->clone(polyline => Slic3r::Polyline->new(@$_)),
+        @{Boost::Geometry::Utils::multi_polygon_multi_linestring_intersection($expolygons, [$self->polyline])};
+}
+
+sub subtract_expolygons {
+    my $self = shift;
+    my ($expolygons) = @_;
+    
+    return map $self->clone(polyline => Slic3r::Polyline->new(@$_)),
+        @{Boost::Geometry::Utils::multi_linestring_multi_polygon_difference([$self->polyline], $expolygons)};
 }
 
 sub simplify {
@@ -101,6 +121,7 @@ sub is_perimeter {
     my $self = shift;
     return $self->role == EXTR_ROLE_PERIMETER
         || $self->role == EXTR_ROLE_EXTERNAL_PERIMETER
+        || $self->role == EXTR_ROLE_OVERHANG_PERIMETER
         || $self->role == EXTR_ROLE_CONTOUR_INTERNAL_PERIMETER;
 }
 
@@ -114,7 +135,8 @@ sub is_fill {
 sub is_bridge {
     my $self = shift;
     return $self->role == EXTR_ROLE_BRIDGE
-        || $self->role == EXTR_ROLE_INTERNALBRIDGE;
+        || $self->role == EXTR_ROLE_INTERNALBRIDGE
+        || $self->role == EXTR_ROLE_OVERHANG_PERIMETER;
 }
 
 sub split_at_acute_angles {
@@ -138,22 +160,15 @@ sub split_at_acute_angles {
             # if the angle between $p[-2], $p[-1], $p3 is too acute
             # then consider $p3 only as a starting point of a new
             # path and stop the current one as it is
-            push @paths, (ref $self)->new(
-                polyline        => Slic3r::Polyline->new(\@p),
-                role            => $self->role,
-                height          => $self->height,
-             );
+            push @paths, $self->clone(polyline => Slic3r::Polyline->new(\@p));
             @p = ($p3);
             push @p, grep $_, shift @points or last;
         } else {
             push @p, $p3;
         }
     }
-    push @paths, (ref $self)->new(
-        polyline        => Slic3r::Polyline->new(\@p),
-        role            => $self->role,
-        height          => $self->height,
-    ) if @p > 1;
+    push @paths, $self->clone(polyline => Slic3r::Polyline->new(\@p))
+        if @p > 1;
     
     return @paths;
 }
@@ -248,12 +263,8 @@ sub detect_arcs {
             );
             
             # points 0..$i form a linear path
-            push @paths, (ref $self)->new(
-                polyline        => Slic3r::Polyline->new(@points[0..$i]),
-                role            => $self->role,
-                flow_spacing    => $self->flow_spacing,
-                height          => $self->height,
-            ) if $i > 0;
+            push @paths, $self->clone(polyline => Slic3r::Polyline->new(@points[0..$i]))
+                if $i > 0;
             
             # add our arc
             push @paths, $arc;
@@ -268,12 +279,8 @@ sub detect_arcs {
     }
     
     # remaining points form a linear path
-    push @paths, (ref $self)->new(
-        polyline        => Slic3r::Polyline->new(\@points),
-        role            => $self->role,
-        flow_spacing    => $self->flow_spacing,
-        height          => $self->height,
-    ) if @points > 1;
+    push @paths, $self->clone(polyline => Slic3r::Polyline->new(\@points))
+        if @points > 1;
     
     return @paths;
 }

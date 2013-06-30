@@ -45,6 +45,7 @@ use constant MI_DOCUMENTATION => &Wx::NewId;
 our $datadir;
 our $no_plater;
 our $mode;
+our $autosave;
 
 our $Settings = {
     _ => {
@@ -118,12 +119,12 @@ sub OnInit {
         $fileMenu->Append(wxID_EXIT, "&Quit", 'Quit Slic3r');
         EVT_MENU($frame, MI_LOAD_CONF, sub { $self->{skeinpanel}->load_config_file });
         EVT_MENU($frame, MI_EXPORT_CONF, sub { $self->{skeinpanel}->export_config });
-        EVT_MENU($frame, MI_QUICK_SLICE, sub { $self->{skeinpanel}->do_slice;
+        EVT_MENU($frame, MI_QUICK_SLICE, sub { $self->{skeinpanel}->quick_slice;
                                                $repeat->Enable(defined $Slic3r::GUI::SkeinPanel::last_input_file) });
-        EVT_MENU($frame, MI_REPEAT_QUICK, sub { $self->{skeinpanel}->do_slice(reslice => 1) });
-        EVT_MENU($frame, MI_QUICK_SAVE_AS, sub { $self->{skeinpanel}->do_slice(save_as => 1);
+        EVT_MENU($frame, MI_REPEAT_QUICK, sub { $self->{skeinpanel}->quick_slice(reslice => 1) });
+        EVT_MENU($frame, MI_QUICK_SAVE_AS, sub { $self->{skeinpanel}->quick_slice(save_as => 1);
                                                  $repeat->Enable(defined $Slic3r::GUI::SkeinPanel::last_input_file) });
-        EVT_MENU($frame, MI_SLICE_SVG, sub { $self->{skeinpanel}->do_slice(save_as => 1, export_svg => 1) });
+        EVT_MENU($frame, MI_SLICE_SVG, sub { $self->{skeinpanel}->quick_slice(save_as => 1, export_svg => 1) });
         EVT_MENU($frame, MI_COMBINE_STLS, sub { $self->{skeinpanel}->combine_stls });
         EVT_MENU($frame, wxID_PREFERENCES, sub { Slic3r::GUI::Preferences->new($frame)->ShowModal });
         EVT_MENU($frame, wxID_EXIT, sub {$_[0]->Close(0)});
@@ -163,13 +164,13 @@ sub OnInit {
         $helpMenu->Append(MI_WEBSITE, "Slic3r &Website", 'Open the Slic3r website in your browser');
         my $versioncheck = $helpMenu->Append(MI_VERSIONCHECK, "Check for &Updates...", 'Check for new Slic3r versions');
         $versioncheck->Enable(Slic3r::GUI->have_version_check);
-        $helpMenu->Append(MI_DOCUMENTATION, "&Documentation", 'Open the Slic3r documentation in your browser');
+        $helpMenu->Append(MI_DOCUMENTATION, "Slic3r &Manual", 'Open the Slic3r manual in your browser');
         $helpMenu->AppendSeparator();
         $helpMenu->Append(wxID_ABOUT, "&About Slic3r", 'Show about dialog');
         EVT_MENU($frame, MI_CONF_WIZARD, sub { $self->{skeinpanel}->config_wizard });
         EVT_MENU($frame, MI_WEBSITE, sub { Wx::LaunchDefaultBrowser('http://slic3r.org/') });
         EVT_MENU($frame, MI_VERSIONCHECK, sub { Slic3r::GUI->check_version(manual => 1) });
-        EVT_MENU($frame, MI_DOCUMENTATION, sub { Wx::LaunchDefaultBrowser('https://github.com/alexrj/Slic3r/wiki/Documentation') });
+        EVT_MENU($frame, MI_DOCUMENTATION, sub { Wx::LaunchDefaultBrowser('http://manual.slic3r.org/') });
         EVT_MENU($frame, wxID_ABOUT, \&about);
     }
     
@@ -252,7 +253,7 @@ sub warning_catcher {
     my ($self, $message_dialog) = @_;
     return sub {
         my $message = shift;
-        return if $message =~ /GLUquadricObjPtr/;
+        return if $message =~ /GLUquadricObjPtr|Attempt to free unreferenced scalar/;
         my @params = ($message, 'Warning', wxOK | wxICON_WARNING);
         $message_dialog
             ? $message_dialog->(@params)
@@ -281,7 +282,8 @@ sub save_settings {
 sub have_version_check {
     my $class = shift;
     
-    return $Slic3r::have_threads && $Slic3r::build && eval "use LWP::UserAgent; 1";
+    # return an explicit 0
+    return ($Slic3r::have_threads && $Slic3r::build && eval "use LWP::UserAgent; 1") || 0;
 }
 
 sub check_version {
@@ -289,6 +291,7 @@ sub check_version {
     my %p = @_;
     Slic3r::debugf "Checking for updates...\n";
     
+    @_ = ();
     threads->create(sub {
         my $ua = LWP::UserAgent->new;
         $ua->timeout(10);
